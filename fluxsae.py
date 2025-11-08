@@ -56,9 +56,14 @@ class FluxActivationSampler:
         return { "activations": self.output, "outputs": output }
     
 class CC3MPromptDataset(Dataset):
-    folder = Path("/data/cc3m/")
-
-    def __init__(self, shuffle:bool=False):
+    def __init__(self, folder: Path | str = None, shuffle:bool=False):
+        if folder is None:
+            # Try both common paths
+            folder = Path("/mnt/drive_a/Projects/sae/data/cc3m/")
+            if not folder.exists():
+                folder = Path("/data/cc3m/")
+        self.folder = Path(folder)
+        
         data = []
         for file in self.folder.glob("*.parquet"):
             data.append(pl.read_parquet(file, columns=["conversations"]))
@@ -80,8 +85,49 @@ def train(**config):
     kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(log_with="wandb", kwargs_handlers=[kwargs])
     accelerator.init_trackers("fluxsae", config=config, init_kwargs={"wandb":{"name":config["name"]}})
-    pages = config["expansion"] * config["features"]
+    
+    match config["dataset"]:
+        case "cc3m":
+            dataset_folder = config.get("dataset_folder") or None
+            shuffle_dataset = config.get("shuffle_dataset", False)
+            dataset = CC3MPromptDataset(folder=dataset_folder, shuffle=shuffle_dataset)
+        case _:
+            raise ValueError(f"Unknown dataset {config['dataset']}")
+    
+    dataloader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=True)
+    sampler = FluxActivationSampler("black-forest-labs/FLUX.1-schnell", loc=config["loc"])
 
+    sampler.pipe.transformer, sampler.pipe.vae, sampler.pipe.text_encoder, sampler.pipe.text_encoder_2 = accelerator.prepare(sampler.pipe.transformer, sampler.pipe.vae, sampler.pipe.text_encoder, sampler.pipe.text_encoder_2)
+    dataloader = accelerator.prepare(dataloader)
+
+    # Auto-detect activation dimension from first batch to validate SAE configuration
+    print("Auto-detecting activation dimension...")
+    dataloader_iter = iter(dataloader)
+    with torch.no_grad():
+        first_batch = next(dataloader_iter)
+        with sampler as s:
+            test_outputs = s(first_batch, height=256, width=256, guidance_scale=0., max_sequence_length=256, num_inference_steps=1,)
+            test_outputs = test_outputs["activations"]
+            double = config["loc"].startswith("transformer_blocks")
+            single = config["loc"].startswith("single_transformer_blocks")
+            match single, double, config["stream"]:
+                case _, True, 0:
+                    test_x, _ = test_outputs
+                case _, True, 1:
+                    _, test_x = test_outputs
+                case True, _, _:
+                    test_x = test_outputs
+            test_x = rearrange(test_x, "b ... d -> (b ...) d")
+            actual_features = test_x.shape[-1]
+    
+    # Validate or auto-correct feature dimension
+    if config["features"] != actual_features:
+        print(f"WARNING: Configured features ({config['features']}) doesn't match actual activation dimension ({actual_features})!")
+        print(f"Auto-correcting to use activation dimension: {actual_features}")
+        config["features"] = actual_features
+    
+    # Create SAE with correct (or auto-corrected) feature dimension
+    pages = config["expansion"] * config["features"]
     match config["arch"]:
         case "standard":
             sae = SparseAutoencoder(features=config["features"], pages=pages)
@@ -89,23 +135,14 @@ def train(**config):
             sae = TopkSparseAutoencoder(features=config["features"], pages=pages, k=config["k"])
         case "gated":
             sae = GatedAutoEncoder(features=config["features"], pages=pages)
-        case "topk":
-            sae = TopkSparseAutoencoder(config["features"], pages, k=config["k"])
-        
-    
-    match config["dataset"]:
-        case "cc3m":
-            dataset = CC3MPromptDataset()
         case _:
-            raise ValueError(f"Unknown dataset {config['dataset']}")
+            raise ValueError(f"Unknown architecture: {config['arch']}")
     
-    dataloader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=True)
     optimizer = torch.optim.AdamW(sae.parameters(), lr=config["lr"], betas=(config["beta1"], config["beta2"]), weight_decay=config["wd"])
-    scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=config["lr_warmup_steps"])   
-    sampler = FluxActivationSampler("black-forest-labs/FLUX.1-schnell", loc=config["loc"])
-
+    scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=config["lr_warmup_steps"])
     sae, optimizer, scheduler = accelerator.prepare(sae, optimizer, scheduler)
-    sampler.pipe.transformer, sampler.pipe.vae, sampler.pipe.text_encoder, sampler.pipe.text_encoder_2 = accelerator.prepare(sampler.pipe.transformer, sampler.pipe.vae, sampler.pipe.text_encoder, sampler.pipe.text_encoder_2)
+    
+    print(f"Using activation dimension: {config['features']}, SAE pages: {pages}")
 
     steps = 0
 
@@ -118,7 +155,9 @@ def train(**config):
             trainer = GatedTrainer(sae, optimizer, scheduler, lmbda=config["lmbda"], lmbda_warmup_steps=config["lmbda_warmup_steps"], accelerator=accelerator)
         
     sae.train()
-    for prompts in tqdm(dataloader):
+    # Continue with the dataloader (first batch was used for dimension detection)
+    # Since dataloader shuffles, this is fine - we'll process all batches
+    for prompts in tqdm(dataloader_iter, total=len(dataloader) - 1, desc="Training"):
         with sampler as s:
             outputs = s(prompts, height=256, width=256, guidance_scale=0., max_sequence_length=256, num_inference_steps=1,)
             outputs = outputs["activations"]
@@ -157,7 +196,9 @@ def train(**config):
 
 @click.command()
 @click.option("--name", type=str, help="Name of the run")
-@click.option("--dataset", type=str, default="journeydb")
+@click.option("--dataset", type=str, default="cc3m", help="Dataset to use (currently only 'cc3m' is supported)")
+@click.option("--dataset-folder", type=str, default=None, help="Path to dataset folder (default: auto-detect)")
+@click.option("--shuffle-dataset/--no-shuffle-dataset", default=False, help="Shuffle dataset at initialization")
 @click.option("--arch", type=str, default="standard")
 @click.option("--num_workers", type=int, default=96)
 @click.option("--batch_size", type=int, default=32)
