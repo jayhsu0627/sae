@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CC3M Image Viewer</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            opacity: 0.9;
+            font-size: 1.1em;
+        }
+
+        .controls {
+            padding: 30px;
+            background: #f8f9fa;
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+            justify-content: center;
+            align-items: center;
+            border-bottom: 2px solid #e9ecef;
+        }
+
+        .controls button {
+            padding: 12px 24px;
+            font-size: 16px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-weight: 600;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+
+        .controls button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+        }
+
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+
+        .btn-secondary {
+            background: #6c757d;
+            color: white;
+        }
+
+        .btn-success {
+            background: #28a745;
+            color: white;
+        }
+
+        .btn-danger {
+            background: #dc3545;
+            color: white;
+        }
+
+        .controls input[type="number"] {
+            padding: 12px;
+            font-size: 16px;
+            border: 2px solid #dee2e6;
+            border-radius: 8px;
+            width: 120px;
+            text-align: center;
+        }
+
+        .controls input[type="number"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .info {
+            padding: 15px 30px;
+            background: #e7f3ff;
+            border-bottom: 1px solid #b3d9ff;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .info span {
+            font-weight: 600;
+            color: #0056b3;
+        }
+
+        .content {
+            padding: 40px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 30px;
+        }
+
+        .image-container {
+            width: 100%;
+            max-width: 800px;
+            background: #f8f9fa;
+            border-radius: 15px;
+            overflow: hidden;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+        }
+
+        .image-container img {
+            width: 100%;
+            height: auto;
+            display: block;
+            max-height: 600px;
+            object-fit: contain;
+            background: #000;
+        }
+
+        .caption-container {
+            width: 100%;
+            max-width: 800px;
+            background: white;
+            border: 2px solid #dee2e6;
+            border-radius: 15px;
+            padding: 25px;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
+        }
+
+        .caption-container h3 {
+            color: #495057;
+            margin-bottom: 15px;
+            font-size: 1.2em;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .caption-container p {
+            color: #212529;
+            font-size: 1.1em;
+            line-height: 1.6;
+            min-height: 50px;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #6c757d;
+            font-size: 1.2em;
+        }
+
+        .loading::after {
+            content: '...';
+            animation: dots 1.5s steps(4, end) infinite;
+        }
+
+        @keyframes dots {
+            0%, 20% { content: '.'; }
+            40% { content: '..'; }
+            60%, 100% { content: '...'; }
+        }
+
+        .error {
+            background: #f8d7da;
+            color: #721c24;
+            padding: 20px;
+            border-radius: 10px;
+            border: 1px solid #f5c6cb;
+            margin: 20px;
+        }
+
+        .mode-toggle {
+            display: flex;
+            gap: 10px;
+            background: white;
+            padding: 5px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+
+        .mode-toggle button {
+            padding: 8px 16px;
+            font-size: 14px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.3s;
+            background: transparent;
+            color: #6c757d;
+        }
+
+        .mode-toggle button.active {
+            background: #667eea;
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🖼️ CC3M Image Viewer</h1>
+            <p>Browse images and captions from the CC3M dataset</p>
+        </div>
+
+        <div class="controls">
+            <div class="mode-toggle">
+                <button id="mode-sequential" class="active" onclick="setMode('sequential')">Sequential</button>
+                <button id="mode-random" onclick="setMode('random')">Random</button>
+            </div>
+            
+            <button class="btn-primary" onclick="loadPrevious()">← Previous</button>
+            <button class="btn-primary" onclick="loadNext()">Next →</button>
+            <button class="btn-success" onclick="loadRandom()">🎲 Random</button>
+            
+            <input type="number" id="image-index" placeholder="Index" min="0" value="0">
+            <button class="btn-secondary" onclick="loadByIndex()">Go to Index</button>
+            
+            <button class="btn-danger" onclick="resetViewer()">Reset</button>
+        </div>
+
+        <div class="info">
+            <span>Current Index: <span id="current-index">-</span></span>
+            <span>Total Images: <span id="total-images">Loading...</span></span>
+            <span>Mode: <span id="current-mode">Sequential</span></span>
+        </div>
+
+        <div class="content">
+            <div class="image-container">
+                <div class="loading" id="image-loading">Loading image</div>
+                <img id="image-display" style="display: none;" alt="CC3M Image" onerror="handleImageError()">
+            </div>
+
+            <div class="caption-container">
+                <h3>📝 Caption</h3>
+                <div class="loading" id="caption-loading">Loading caption</div>
+                <p id="caption-text" style="display: none;"></p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentIndex = 0;
+        let totalImages = 0;
+        let mode = 'sequential'; // 'sequential' or 'random'
+        let imageHistory = [0]; // Track navigation history
+
+        // Initialize
+        async function init() {
+            try {
+                const response = await fetch('/api/total');
+                const data = await response.json();
+                totalImages = data.total;
+                document.getElementById('total-images').textContent = totalImages.toLocaleString();
+                document.getElementById('image-index').max = totalImages - 1;
+                
+                // Load first image
+                await loadImage(0);
+            } catch (error) {
+                console.error('Error initializing:', error);
+                showError('Failed to initialize viewer. Make sure the server is running.');
+            }
+        }
+
+        function setMode(newMode) {
+            mode = newMode;
+            document.getElementById('mode-sequential').classList.toggle('active', newMode === 'sequential');
+            document.getElementById('mode-random').classList.toggle('active', newMode === 'random');
+            document.getElementById('current-mode').textContent = newMode === 'sequential' ? 'Sequential' : 'Random';
+        }
+
+        async function loadImage(idx) {
+            if (idx < 0 || idx >= totalImages) {
+                showError(`Index ${idx} is out of range (0-${totalImages - 1})`);
+                return;
+            }
+
+            currentIndex = idx;
+            document.getElementById('current-index').textContent = idx.toLocaleString();
+            document.getElementById('image-index').value = idx;
+
+            // Show loading states
+            document.getElementById('image-loading').style.display = 'block';
+            document.getElementById('image-display').style.display = 'none';
+            document.getElementById('caption-loading').style.display = 'block';
+            document.getElementById('caption-text').style.display = 'none';
+
+            try {
+                // Load caption
+                const captionResponse = await fetch(`/api/caption/${idx}`);
+                const captionData = await captionResponse.json();
+                document.getElementById('caption-text').textContent = captionData.caption;
+                document.getElementById('caption-loading').style.display = 'none';
+                document.getElementById('caption-text').style.display = 'block';
+
+                // Load image
+                const imagePathResponse = await fetch(`/api/image-path/${idx}`);
+                if (imagePathResponse.ok) {
+                    const pathData = await imagePathResponse.json();
+                    // Path is already relative like "images/train-00000-of-00281/0.jpg"
+                    const imageUrl = `/${pathData.path}?t=${Date.now()}`;
+                    const img = document.getElementById('image-display');
+                    img.src = imageUrl;
+                    img.onload = () => {
+                        document.getElementById('image-loading').style.display = 'none';
+                        img.style.display = 'block';
+                    };
+                    img.onerror = () => {
+                        document.getElementById('image-loading').style.display = 'none';
+                        handleImageError();
+                    };
+                } else {
+                    showError(`Failed to get image path for index ${idx}`);
+                    document.getElementById('image-loading').style.display = 'none';
+                }
+            } catch (error) {
+                console.error('Error loading image:', error);
+                showError(`Failed to load image ${idx}: ${error.message}`);
+            }
+        }
+
+        function loadNext() {
+            if (mode === 'sequential') {
+                const nextIdx = (currentIndex + 1) % totalImages;
+                loadImage(nextIdx);
+            } else {
+                loadRandom();
+            }
+        }
+
+        function loadPrevious() {
+            if (mode === 'sequential') {
+                const prevIdx = (currentIndex - 1 + totalImages) % totalImages;
+                loadImage(prevIdx);
+            } else {
+                // In random mode, go back in history
+                if (imageHistory.length > 1) {
+                    imageHistory.pop(); // Remove current
+                    const prevIdx = imageHistory[imageHistory.length - 1];
+                    loadImage(prevIdx);
+                } else {
+                    loadRandom();
+                }
+            }
+        }
+
+        async function loadRandom() {
+            try {
+                const response = await fetch('/api/random');
+                const data = await response.json();
+                imageHistory.push(data.index);
+                await loadImage(data.index);
+            } catch (error) {
+                console.error('Error loading random image:', error);
+                // Fallback to sequential random
+                const randomIdx = Math.floor(Math.random() * totalImages);
+                imageHistory.push(randomIdx);
+                await loadImage(randomIdx);
+            }
+        }
+
+        function loadByIndex() {
+            const idx = parseInt(document.getElementById('image-index').value);
+            if (!isNaN(idx)) {
+                imageHistory.push(idx);
+                loadImage(idx);
+            }
+        }
+
+        function resetViewer() {
+            imageHistory = [0];
+            loadImage(0);
+        }
+
+        function handleImageError() {
+            document.getElementById('image-loading').style.display = 'none';
+            document.getElementById('image-display').style.display = 'none';
+            showError('Failed to load image. The image file might not exist.');
+        }
+
+        function showError(message) {
+            const errorDiv = document.createElement('div');
+            errorDiv.className = 'error';
+            errorDiv.textContent = message;
+            document.querySelector('.content').insertBefore(errorDiv, document.querySelector('.content').firstChild);
+            setTimeout(() => errorDiv.remove(), 5000);
+        }
+
+        // Keyboard navigation
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowLeft') {
+                loadPrevious();
+            } else if (e.key === 'ArrowRight') {
+                loadNext();
+            } else if (e.key === 'r' || e.key === 'R') {
+                loadRandom();
+            }
+        });
+
+        // Initialize on load
+        init();
+    </script>
+</body>
+</html>
+

@@ -108,15 +108,18 @@ def train(**config):
         with sampler as s:
             test_outputs = s(first_batch, height=256, width=256, guidance_scale=0., max_sequence_length=256, num_inference_steps=1,)
             test_outputs = test_outputs["activations"]
-            double = config["loc"].startswith("transformer_blocks")
-            single = config["loc"].startswith("single_transformer_blocks")
-            match single, double, config["stream"]:
-                case _, True, 0:
+            # Handle both tuple outputs (attention) and single tensor outputs (MLP, single blocks)
+            if isinstance(test_outputs, tuple):
+                # Attention modules return tuple (query, key)
+                if config["stream"] == 0:
                     test_x, _ = test_outputs
-                case _, True, 1:
+                elif config["stream"] == 1:
                     _, test_x = test_outputs
-                case True, _, _:
-                    test_x = test_outputs
+                else:
+                    raise ValueError(f"Invalid stream {config['stream']} for tuple output. Use 0 (query) or 1 (key).")
+            else:
+                # Single tensor output (MLP/FF, single_transformer_blocks, etc.)
+                test_x = test_outputs
             test_x = rearrange(test_x, "b ... d -> (b ...) d")
             actual_features = test_x.shape[-1]
     
@@ -161,15 +164,18 @@ def train(**config):
         with sampler as s:
             outputs = s(prompts, height=256, width=256, guidance_scale=0., max_sequence_length=256, num_inference_steps=1,)
             outputs = outputs["activations"]
-            double = config["loc"].startswith("transformer_blocks")
-            single = config["loc"].startswith("single_transformer_blocks")
-            match single, double, config["stream"]:
-                case _, True, 0:
+            # Handle both tuple outputs (attention) and single tensor outputs (MLP, single blocks)
+            if isinstance(outputs, tuple):
+                # Attention modules return tuple (query, key)
+                if config["stream"] == 0:
                     x, _ = outputs
-                case _, True, 1:
+                elif config["stream"] == 1:
                     _, x = outputs
-                case True, _, _:
-                    x = outputs
+                else:
+                    raise ValueError(f"Invalid stream {config['stream']} for tuple output. Use 0 (query) or 1 (key).")
+            else:
+                # Single tensor output (MLP/FF, single_transformer_blocks, etc.)
+                x = outputs
 
             x = rearrange(x, "b ... d -> (b ...) d")
 

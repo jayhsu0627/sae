@@ -8,6 +8,9 @@
 run.sh
 checkpoints/
 data/
+output/
+writings/
+markdown/
 wandb/
 visualisation/
 __pycache__/
