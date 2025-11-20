@@ -77,6 +77,66 @@ class TopkSparseAutoencoder(
         offset[..., k] = strength
 
         return self.decode(encoded + offset)
+    
+    def get_active_features(self, x):
+        """
+        Returns the indices of active (top-k) features for input x.
+        
+        Args:
+            x: Input tensor of shape (..., features)
+            
+        Returns:
+            active_indices: Tensor of shape (..., k) containing the indices
+            active_values: Tensor of shape (..., k) containing activation values
+        """
+        encoded, active_values, active_indices = self.encode(x, return_topk=True)
+        return active_indices, active_values
+
+    def surgery_gytis_style(
+        self, x, k: int, strength: float = 1,
+        fallback_to_additive: bool = True
+    ):
+        """
+        Gytis-style surgery: Only boosts features already in top-k.
+        If feature k is not active, either skip it or use additive method.
+        
+        Args:
+            x: Input tensor
+            k: Feature index to boost
+            strength: How much to boost
+            fallback_to_additive: If True, use additive if feature not in top-k
+            
+        Returns:
+            Steered output
+        """
+        # Get active features
+        encoded, active_values, active_indices = self.encode(x, return_topk=True)
+
+        # Check if feature k is in the active set
+        # active_indices shape: (batch, k) or (batch*seq, k)
+        is_active = (active_indices == k).any(dim=-1)
+
+        if is_active.all():
+            # Feature k is active for all samples - boost it (Gytis-style)
+            offset = torch.zeros_like(encoded)
+            offset[..., k] = strength
+            return self.decode(encoded + offset)
+        elif fallback_to_additive and not is_active.any():
+            # Feature k not active - use additive method
+            feature_direction = self.decoder.weight[:, k]
+            return x + strength * feature_direction.unsqueeze(0)
+        else:
+            # Mixed case: active for some, not for others
+            offset = torch.zeros_like(encoded)
+            offset[..., k] = strength
+
+            boosted = self.decode(encoded + offset)
+            feature_direction = self.decoder.weight[:, k]
+            additive = x + strength * feature_direction.unsqueeze(0)
+
+            # Use boosted where active, additive where not
+            is_active_expanded = is_active.unsqueeze(-1).expand_as(x)
+            return torch.where(is_active_expanded, boosted, additive)
 
 
     def forward(self, x, output_features: bool = False):
