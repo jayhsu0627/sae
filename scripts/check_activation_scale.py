@@ -2,17 +2,16 @@
 Script to check the actual scale of FLUX activations.
 This will help us understand what strength values are appropriate.
 """
-import torch
-from diffusers import FluxPipeline
-from einops import rearrange
-from fluxsae import FluxActivationSampler
+import sys
+from pathlib import Path
 
-# Load FLUX
-pipe = FluxPipeline.from_pretrained(
-    "black-forest-labs/FLUX.1-schnell",
-    torch_dtype=torch.bfloat16
-)
-pipe = pipe.to("cuda")
+# Add parent directory to path to allow importing from project root
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import torch
+from einops import rearrange
+
+from fluxsae import FluxActivationSampler
 
 # Test prompts
 test_prompts = [
@@ -66,20 +65,23 @@ for loc in locations:
     # Concatenate all activations
     all_activations = torch.cat(all_activations, dim=0)
     
+    # Convert to float32 for quantile computation (quantile requires float or double)
+    all_activations_float = all_activations.float()
+    
     # Compute statistics
-    mean_val = all_activations.mean().item()
-    std_val = all_activations.std().item()
-    min_val = all_activations.min().item()
-    max_val = all_activations.max().item()
+    mean_val = all_activations_float.mean().item()
+    std_val = all_activations_float.std().item()
+    min_val = all_activations_float.min().item()
+    max_val = all_activations_float.max().item()
     
     # Compute percentiles
-    p25 = torch.quantile(all_activations, 0.25).item()
-    p50 = torch.quantile(all_activations, 0.50).item()
-    p75 = torch.quantile(all_activations, 0.75).item()
-    p95 = torch.quantile(all_activations, 0.95).item()
-    p99 = torch.quantile(all_activations, 0.99).item()
+    p25 = torch.quantile(all_activations_float, 0.25).item()
+    p50 = torch.quantile(all_activations_float, 0.50).item()
+    p75 = torch.quantile(all_activations_float, 0.75).item()
+    p95 = torch.quantile(all_activations_float, 0.95).item()
+    p99 = torch.quantile(all_activations_float, 0.99).item()
     
-    print(f"  Shape: {all_activations.shape}")
+    print(f"  Shape: {all_activations_float.shape}")
     print(f"  Mean: {mean_val:.4f}")
     print(f"  Std:  {std_val:.4f}")
     print(f"  Min:  {min_val:.4f}")
@@ -92,11 +94,11 @@ for loc in locations:
     print(f"    P99: {p99:.4f}")
     
     # Check if activations are mostly positive or can be negative
-    negative_ratio = (all_activations < 0).float().mean().item() * 100
+    negative_ratio = (all_activations_float < 0).float().mean().item() * 100
     print(f"  Negative values: {negative_ratio:.2f}%")
     
     # Compute L2 norm per activation vector
-    norms = all_activations.norm(dim=-1)
+    norms = all_activations_float.norm(dim=-1)
     print(f"  L2 norm per vector:")
     print(f"    Mean: {norms.mean().item():.4f}")
     print(f"    Std:  {norms.std().item():.4f}")
