@@ -94,51 +94,168 @@ class TopkSparseAutoencoder(
 
     def surgery_gytis_style(
         self, x, k: int, strength: float = 1,
-        fallback_to_additive: bool = True
+        fallback_to_additive: bool = True,
+        preserve_reconstruction_error: bool = False,
+        return_original_on_zero: bool = True
     ):
         """
         Gytis-style surgery: Only boosts features already in top-k.
         If feature k is not active, either skip it or use additive method.
         
+        Supports decrease->original->amplify:
+        - strength < 0: Decreases feature k activation
+        - strength = 0: Returns original x (if return_original_on_zero=True) or SAE reconstruction
+        - strength > 0: Amplifies feature k activation
+        
         Args:
             x: Input tensor
-            k: Feature index to boost
-            strength: How much to boost
-            fallback_to_additive: If True, use additive if feature not in top-k
+            k: Feature index to modify
+            strength: How much to modify the feature
+                      - < 0: decrease
+                      - = 0: no modification
+                      - > 0: increase
+            fallback_to_additive: If True, use additive method if feature not in top-k
+            preserve_reconstruction_error: If True, adds back reconstruction error.
+                                           WARNING: Can be noisy for FLUX during generation!
+                                           Better for static embeddings (CLIP-style).
+            return_original_on_zero: If True, strength=0 returns original x directly.
+                                     If False, returns SAE reconstruction.
             
         Returns:
             Steered output
         """
-        # Get active features
-        encoded, active_values, active_indices = self.encode(x, return_topk=True)
-
+        # Special handling for strength=0
+        if strength == 0.0:
+            if return_original_on_zero:
+                # Return original activation directly (no SAE processing)
+                # This ensures consistency with unmodified generation
+                return x
+            else:
+                # Return SAE reconstruction (consistent with other strengths)
+                encoded_original = self.encode(x)
+                decoded_original = self.decode(encoded_original)
+                if preserve_reconstruction_error:
+                    reconstruction_error = x - decoded_original
+                    return decoded_original + reconstruction_error
+                else:
+                    return decoded_original
+        
+        # Get active features for strength != 0
+        encoded_original, active_values, active_indices = self.encode(x, return_topk=True)
+        
+        # Compute reconstruction error only if needed
+        if preserve_reconstruction_error:
+            decoded_original = self.decode(encoded_original)
+            reconstruction_error = x - decoded_original
+        
         # Check if feature k is in the active set
         # active_indices shape: (batch, k) or (batch*seq, k)
         is_active = (active_indices == k).any(dim=-1)
 
         if is_active.all():
-            # Feature k is active for all samples - boost it (Gytis-style)
-            offset = torch.zeros_like(encoded)
+            # Feature k is active for all samples - modify it (Gytis-style)
+            # Note: encoded_original[k] already contains the current activation value
+            # We add strength to it (can be negative to decrease)
+            offset = torch.zeros_like(encoded_original)
             offset[..., k] = strength
-            return self.decode(encoded + offset)
+            decoded_modified = self.decode(encoded_original + offset)
+            
+            # Add back reconstruction error only if requested (can be noisy for FLUX!)
+            if preserve_reconstruction_error:
+                return decoded_modified + reconstruction_error
+            else:
+                return decoded_modified
+                
         elif fallback_to_additive and not is_active.any():
             # Feature k not active - use additive method
+            # This works for both positive and negative strengths
             feature_direction = self.decoder.weight[:, k]
-            return x + strength * feature_direction.unsqueeze(0)
+            additive_result = x + strength * feature_direction.unsqueeze(0)
+            
+            # Add back error only if requested
+            if preserve_reconstruction_error:
+                return additive_result + reconstruction_error
+            else:
+                return additive_result
+                
         else:
             # Mixed case: active for some, not for others
-            offset = torch.zeros_like(encoded)
+            offset = torch.zeros_like(encoded_original)
             offset[..., k] = strength
 
-            boosted = self.decode(encoded + offset)
+            boosted = self.decode(encoded_original + offset)
             feature_direction = self.decoder.weight[:, k]
             additive = x + strength * feature_direction.unsqueeze(0)
 
             # Use boosted where active, additive where not
             is_active_expanded = is_active.unsqueeze(-1).expand_as(x)
-            return torch.where(is_active_expanded, boosted, additive)
+            result = torch.where(is_active_expanded, boosted, additive)
+            
+            # Add back error only if requested
+            if preserve_reconstruction_error:
+                return result + reconstruction_error
+            else:
+                return result
 
-
+    def surgery_with_error_preservation(
+        self, x, k: int, strength: float = 1,
+        fallback_to_additive: bool = True
+    ):
+        """
+        CLIP-style surgery with reconstruction error preservation.
+        
+        This method preserves information that the SAE couldn't reconstruct by
+        adding back the reconstruction error from the original encoding.
+        
+        Based on Gytis's CLIP SAE steering approach:
+        1. Encode original activation
+        2. Compute reconstruction error (original - decoded)
+        3. Modify feature k
+        4. Decode modified features
+        5. Add back the original reconstruction error
+        
+        This preserves information that would otherwise be lost, potentially
+        improving steering quality.
+        
+        Args:
+            x: Input tensor of shape (batch, features) or (batch*seq, features)
+            k: Feature index to boost (0 to pages-1)
+            strength: How much to boost the feature
+            fallback_to_additive: If True, use additive method if feature not in top-k
+            
+        Returns:
+            Steered output with reconstruction error preserved
+        """
+        # Step 1: Encode original activation
+        encoded_original = self.encode(x)
+        
+        # Step 2: Compute reconstruction error (information SAE couldn't capture)
+        decoded_original = self.decode(encoded_original)
+        reconstruction_error = x - decoded_original
+        
+        # Step 3: Check if feature k is in top-k (for Gytis-style behavior)
+        if fallback_to_additive:
+            _, _, active_indices = self.encode(x, return_topk=True)
+            is_active = (active_indices == k).any(dim=-1)
+            
+            if not is_active.any():
+                # Feature not active - use additive method with error preservation
+                feature_direction = self.decoder.weight[:, k]
+                additive_result = x + strength * feature_direction.unsqueeze(0)
+                # Still add back error to preserve information
+                return additive_result + reconstruction_error
+        
+        # Step 4: Modify feature k
+        encoded_modified = encoded_original.clone()
+        encoded_modified[..., k] += strength
+        
+        # Step 5: Decode modified features
+        decoded_modified = self.decode(encoded_modified)
+        
+        # Step 6: Add back reconstruction error to preserve lost information
+        # return decoded_modified + reconstruction_error
+        return decoded_modified
+        
     def forward(self, x, output_features: bool = False):
         encoded_acts_BF = self.encode(x)
         xhat_BD = self.decode(encoded_acts_BF)
