@@ -1,0 +1,47 @@
+# Fixed training parameters for hyperparameter testing
+# These values remain constant across all hyperparameter combinations
+
+# Architecture
+arch: "topk"
+
+# Dataset
+dataset: "cc3m"
+dataset_folder: null  # Auto-detect if null
+shuffle_dataset: false
+
+# Model dimensions (features will be auto-detected, but this is initial value)
+features: 3072
+
+# Training hyperparameters
+# batch_size: 8
+# batch_size: 128
+batch_size: 8
+lr: 1e-4  # Matches reference implementation (was 5e-5)
+lr_warmup_steps: 128
+beta1: 0.9
+beta2: 0.999
+wd: 0.0
+
+# TopK SAE specific parameters
+# auxk: 0.03125  # Fraction of pages (0.03125 * 12288 ≈ 384, close to reference's 256)
+auxk: 256
+auxk_coef: 0.03125  # Critical: matches reference (1/32), prevents auxk loss from being too strong
+dead_steps_threshold: 1000000  # Matches reference (10M, was defaulting to 1M)
+bodycount: 8192
+
+# Regularization (for architectures that use it)
+lmbda: 0.01
+lmbda_warmup_steps: 128
+
+# Training duration
+iters: 2500
+nsamples: 128
+
+# Other settings
+normalise: true  # Critical: matches reference implementation (decoder normalization after each step)
+num_workers: 4
+
+# Output directory
+# base_savedir: "./checkpoints/hyperparameter_test"
+base_savedir: "./checkpoints/base_test"
+

@@ -1,0 +1,40 @@
+# Hooking points to test in FLUX transformer
+# Each entry defines:
+#   - loc: the module path to hook
+#   - stream: 0 for image stream (query), 1 for text stream (key)
+#   - description: human-readable description
+
+hooking_points:
+  # - loc: "transformer_blocks.0.ff"
+  #   stream: 0
+  #   description: "Transformer block 0 feedforward (image stream)"
+  
+  # - loc: "transformer_blocks.0.attn"
+  #   stream: 0
+  #   description: "Transformer block 0 attention (image stream)"
+
+  # - loc: "transformer_blocks.18"
+  #   stream: 0
+  #   description: "Transformer block 18"
+  
+  # - loc: "transformer_blocks.18.ff"
+  #   stream: 0
+  #   description: "Transformer block 18 feedforward (image stream)"
+  
+  # - loc: "transformer_blocks.18.attn"
+  #   stream: 0
+  #   description: "Transformer block 18 attention (image stream)"
+  
+
+  - loc: "transformer_blocks.1"
+    stream: 0
+    description: "Transformer block 1"
+  
+  - loc: "transformer_blocks.1.ff"
+    stream: 0
+    description: "Transformer block 1 feedforward (image stream)"
+  
+  - loc: "transformer_blocks.1.attn"
+    stream: 0
+    description: "Transformer block 1 attention (image stream)"
+  

@@ -26,6 +26,81 @@ from einops import reduce, einsum
 
 # NOTE: implementations are taken from dictionary_learning repository
 
+# Geometric median computation for pre_bias initialization
+def weighted_average(points: torch.Tensor, weights: torch.Tensor):
+    weights = weights / weights.sum()
+    return (points * weights.view(-1, 1)).sum(dim=0)
+
+
+@torch.no_grad()
+def geometric_median_objective(
+    median: torch.Tensor, points: torch.Tensor, weights: torch.Tensor
+) -> torch.Tensor:
+    norms = torch.linalg.norm(points - median.view(1, -1), dim=1)
+    return (norms * weights).sum()
+
+
+def compute_geometric_median(
+    points: torch.Tensor,
+    weights: torch.Tensor | None = None,
+    eps: float = 1e-6,
+    maxiter: int = 100,
+    ftol: float = 1e-20,
+):
+    """
+    Compute geometric median of points using Weiszfeld iterations.
+    
+    :param points: torch.Tensor of shape (n, d)
+    :param weights: Optional torch.Tensor of shape (n,)
+    :param eps: Smallest allowed value of denominator, to avoid divide by zero
+    :param maxiter: Maximum number of Weiszfeld iterations
+    :param ftol: If objective value does not improve by at least this fraction, terminate
+    :return: torch.Tensor of shape (d,) - the geometric median
+    """
+    if weights is None:
+        weights = torch.ones((points.shape[0],), device=points.device)
+    
+    # Initialize median estimate at mean
+    new_weights = weights
+    median = weighted_average(points, weights)
+    objective_value = geometric_median_objective(median, points, weights)
+    
+    # Weiszfeld iterations
+    for _ in range(maxiter):
+        prev_obj_value = objective_value
+        
+        norms = torch.linalg.norm(points - median.view(1, -1), dim=1)
+        new_weights = weights / torch.clamp(norms, min=eps)
+        median = weighted_average(points, new_weights)
+        objective_value = geometric_median_objective(median, points, weights)
+        
+        if abs(prev_obj_value - objective_value) <= ftol * objective_value:
+            break
+    
+    return weighted_average(points, new_weights)
+
+
+def unit_norm_decoder_(autoencoder) -> None:
+    """
+    Unit normalize the decoder weights of an autoencoder.
+    """
+    autoencoder.decoder.weight.data /= autoencoder.decoder.weight.data.norm(dim=0, keepdim=True)
+
+
+def unit_norm_decoder_grad_adjustment_(autoencoder) -> None:
+    """
+    Project out gradient information parallel to the dictionary vectors.
+    Assumes that the decoder is already unit normed.
+    """
+    if autoencoder.decoder.weight.grad is None:
+        return
+    
+    autoencoder.decoder.weight.grad += (
+        torch.einsum("df,df->f", autoencoder.decoder.weight.data, autoencoder.decoder.weight.grad) *
+        autoencoder.decoder.weight.data * -1
+    )
+
+
 class TopkSparseAutoencoder(
         nn.Module,
         PyTorchModelHubMixin,
@@ -33,41 +108,97 @@ class TopkSparseAutoencoder(
         repo_url="https://github.com/RE-N-Y/finebooru"
     ):
 
-    def __init__(self, features: int, pages: int, k: int, sample = None):
+    def __init__(
+        self, 
+        features: int, 
+        pages: int, 
+        k: int, 
+        auxk: int | None = None,
+        dead_steps_threshold: int = 1000000,
+        sample = None
+    ):
         super().__init__()
         self.features = features
         self.pages = pages
         self.k = k
+        # auxk can be int or float (fraction of pages)
+        if auxk is not None:
+            if isinstance(auxk, float) and auxk < 1.0:
+                # Convert fraction to actual number
+                self.auxk = int(auxk * pages)
+            else:
+                self.auxk = int(auxk)
+        else:
+            self.auxk = None
+        self.dead_steps_threshold = dead_steps_threshold
 
-        self.encoder = nn.Linear(features, pages)
-        self.encoder.bias.data.zero_()
-
+        self.encoder = nn.Linear(features, pages, bias=False)
         self.decoder = nn.Linear(pages, features, bias=False)
-        self.bias = nn.Parameter(torch.zeros(features))
 
-        # tie encoder and decoder weights and normalize
+        # Separate biases: pre_bias (input) and latent_bias (latent)
+        self.pre_bias = nn.Parameter(torch.zeros(features))
+        self.latent_bias = nn.Parameter(torch.zeros(pages))
+
+        # Track dead features: steps since last activation
+        self.stats_last_nonzero: torch.Tensor
+        self.register_buffer("stats_last_nonzero", torch.zeros(pages, dtype=torch.long))
+
+        # Auxk mask function for dead feature revival
+        def auxk_mask_fn(x):
+            dead_mask = self.stats_last_nonzero > dead_steps_threshold
+            x.data *= dead_mask  # inplace to save memory
+            return x
+
+        self.auxk_mask_fn = auxk_mask_fn
+
+        # Tie encoder and decoder weights and normalize
         eweight = self.encoder.weight.data.clone()
-        self.decoder.weight.data = eweight.T
-        self.decoder.weight.data = self.decoder.weight.data / self.decoder.weight.data.norm(dim=0, keepdim=True)
+        self.decoder.weight.data = eweight.T.clone()
+        
+        # Store decoder in column major layout for kernel efficiency
+        self.decoder.weight.data = self.decoder.weight.data.T.contiguous().T
+        
+        unit_norm_decoder_(self)
 
     def encode(self, x, return_topk: bool = False):
-        post_relu_feat_acts_BF = nn.functional.relu(self.encoder(x - self.bias))
-        post_topk = post_relu_feat_acts_BF.topk(self.k, sorted=False, dim=-1)
-
-        # We can't split immediately due to nnsight
-        tops_acts_BK = post_topk.values
-        top_indices_BK = post_topk.indices
-
-        buffer_BF = torch.zeros_like(post_relu_feat_acts_BF)
-        encoded_acts_BF = buffer_BF.scatter_(dim=-1, index=top_indices_BK, src=tops_acts_BK)
+        x = x - self.pre_bias
+        latents_pre_act = self.encoder(x) + self.latent_bias
+        
+        vals, inds = torch.topk(latents_pre_act, k=self.k, dim=-1)
+        
+        latents = torch.zeros_like(latents_pre_act)
+        latents.scatter_(-1, inds, torch.relu(vals))
 
         if return_topk:
-            return encoded_acts_BF, tops_acts_BK, top_indices_BK
+            return latents, vals, inds
         else:
-            return encoded_acts_BF
+            return latents
 
     def decode(self, x):
-        return self.decoder(x) + self.bias
+        return self.decoder(x) + self.pre_bias
+    
+    def decode_sparse(self, inds, vals):
+        """
+        Decode from sparse indices and values.
+        
+        Args:
+            inds: Tensor of shape (batch, k) containing feature indices
+            vals: Tensor of shape (batch, k) containing activation values
+            
+        Returns:
+            Reconstructed tensor of shape (batch, features)
+        """
+        rows, cols = inds.shape[0], self.pages
+        
+        row_indices = torch.arange(rows, device=inds.device).unsqueeze(1).expand(-1, inds.shape[1]).reshape(-1)
+        vals_flat = vals.reshape(-1)
+        inds_flat = inds.reshape(-1)
+
+        indices = torch.stack([row_indices, inds_flat])
+        sparse_tensor = torch.sparse_coo_tensor(indices, vals_flat, torch.Size([rows, cols]))
+        
+        recons = torch.sparse.mm(sparse_tensor, self.decoder.weight.T) + self.pre_bias
+        return recons
     
     def surgery(self, x, k:int, strength:float = 1):
         encoded = self.encode(x)
@@ -257,14 +388,84 @@ class TopkSparseAutoencoder(
         return decoded_modified
         
     def forward(self, x, output_features: bool = False):
-        encoded_acts_BF = self.encode(x)
-        xhat_BD = self.decode(encoded_acts_BF)
-
-        if not output_features:
-            return xhat_BD
-        else:
-            return xhat_BD, encoded_acts_BF
+        x = x - self.pre_bias
+        latents_pre_act = self.encoder(x) + self.latent_bias
         
+        vals, inds = torch.topk(latents_pre_act, k=self.k, dim=-1)
+        
+        # Update stats_last_nonzero for dead feature tracking
+        tmp = torch.zeros_like(self.stats_last_nonzero)
+        tmp.scatter_add_(
+            0,
+            inds.reshape(-1),
+            (vals > 1e-3).to(tmp.dtype).reshape(-1),
+        )
+        self.stats_last_nonzero *= 1 - tmp.clamp(max=1)
+        self.stats_last_nonzero += 1
+        
+        # Auxk: select top-k from dead features
+        auxk_inds = None
+        auxk_vals = None
+        if self.auxk is not None:
+            # IMPORTANT: has to go after stats update!
+            # WARN: auxk_mask_fn can mutate latents_pre_act!
+            auxk_vals, auxk_inds = torch.topk(
+                self.auxk_mask_fn(latents_pre_act),
+                k=self.auxk,
+                dim=-1
+            )
+            auxk_vals = torch.relu(auxk_vals)
+        
+        vals = torch.relu(vals)
+        
+        # Use sparse matrix multiplication for efficiency
+        rows, cols = latents_pre_act.size()
+        row_indices = torch.arange(rows, device=inds.device).unsqueeze(1).expand(-1, self.k).reshape(-1)
+        vals_flat = vals.reshape(-1)
+        inds_flat = inds.reshape(-1)
+        
+        indices = torch.stack([row_indices, inds_flat])
+        sparse_tensor = torch.sparse_coo_tensor(indices, vals_flat, torch.Size([rows, cols]))
+        
+        recons = torch.sparse.mm(sparse_tensor, self.decoder.weight.T) + self.pre_bias
+        
+        if not output_features:
+            return recons
+        else:
+            # Build info dict with proper shapes
+            info = {
+                "inds": inds,  # Keep as (batch, k) for easier use
+                "vals": vals,  # Keep as (batch, k) for easier use
+                "auxk_inds": auxk_inds if auxk_inds is not None else None,
+                "auxk_vals": auxk_vals if auxk_vals is not None else None,
+            }
+            # Also return dictionary (encoded features) for backward compatibility
+            dictionary = torch.zeros_like(latents_pre_act)
+            dictionary.scatter_(-1, inds, vals)
+            return recons, dictionary, info
+    
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+
+def init_pre_bias_from_data(ae: "TopkSparseAutoencoder", stats_acts_sample: torch.Tensor):
+    """
+    Initialize pre_bias using geometric median of a sample of activations.
+    
+    Args:
+        ae: TopkSparseAutoencoder instance
+        stats_acts_sample: Sample tensor of activations of shape (n_samples, features)
+    """
+    # Use first 32768 samples or all if less
+    sample_size = min(32768, stats_acts_sample.shape[0])
+    sample = stats_acts_sample[:sample_size].float()
+    
+    if sample.device.type != "cpu":
+        sample = sample.cpu()
+    
+    median = compute_geometric_median(sample)
+    ae.pre_bias.data = median.to(ae.pre_bias.device).float()
 
 
 # standard sparse autoencoder
@@ -521,6 +722,73 @@ def tohist(data):
     data = np.histogram(data, bins=256)
     return wandb.Histogram(np_histogram=data)
 
+def explained_variance(recons, x):
+    """
+    Compute explained variance metric.
+    Measures how much variance in the original data is captured by the reconstruction.
+    
+    Args:
+        recons: Reconstructed tensor
+        x: Original tensor
+        
+    Returns:
+        Mean explained variance (scalar)
+    """
+    # Compute the variance of the difference
+    diff = x - recons
+    diff_var = torch.var(diff, dim=0, unbiased=False)
+
+    # Compute the variance of the original tensor
+    x_var = torch.var(x, dim=0, unbiased=False)
+
+    # Avoid division by zero
+    explained_var = 1 - diff_var / (x_var + 1e-8)
+
+    return explained_var.mean()
+
+
+def mse(recons, x):
+    """Mean squared error."""
+    return ((recons - x) ** 2).mean()
+
+
+def normalized_mse(recon: torch.Tensor, xs: torch.Tensor) -> torch.Tensor:
+    """
+    Normalized MSE used for auxk loss.
+    Normalized by the MSE of the mean baseline.
+    """
+    xs_mu = xs.mean(dim=0)
+    loss = mse(recon, xs) / mse(
+        xs_mu[None, :].expand_as(xs), xs
+    )
+    return loss
+
+
+class FeaturesStats:
+    """
+    Track feature activation statistics for logging.
+    """
+    def __init__(self, dim, logger, accelerator=None):
+        self.dim = dim
+        self.logger = logger
+        self.accelerator = accelerator
+        self.reinit()
+
+    def reinit(self):
+        device = self.accelerator.device if self.accelerator else "cuda"
+        self.n_activated = torch.zeros(self.dim, dtype=torch.long, device=device)
+        self.n = 0
+    
+    def update(self, inds):
+        self.n += inds.shape[0]
+        inds = inds.flatten().detach()
+        self.n_activated.scatter_add_(0, inds, torch.ones_like(inds))
+
+    def log(self):
+        if self.n > 0:
+            activation_freq = (self.n_activated / self.n + 1e-9).log10().cpu().numpy()
+            self.logger.logkv('activated', activation_freq)
+
 class StandardTrainer:
     def __init__(
         self, 
@@ -544,7 +812,12 @@ class StandardTrainer:
         self.optimizer.zero_grad()
 
         b, f = x.shape
-        xhat, dictionary = self.sae(x, output_features=True)
+        result = self.sae(x, output_features=True)
+        # Handle both old format (recons, dict) and new format (recons, dict, info)
+        if len(result) == 3:
+            xhat, dictionary, _ = result
+        else:
+            xhat, dictionary = result
         cossim = torch.nn.CosineSimilarity(dim=-1)
         l2 = reduce((x - xhat) ** 2, "b f -> b", "sum").mean()
         l1 = dictionary.norm(p=1, dim=-1).mean()
@@ -555,6 +828,9 @@ class StandardTrainer:
 
         # Metric taken from OpenAI's TopK SAE paper
         l2_normalised = ((xhat - x) ** 2).mean(dim=-1).mean() / (x ** 2).mean(dim=-1).mean()
+
+        # Explained variance metric
+        explained_var = explained_variance(xhat, x)
 
         # Feature density (i.e. fraction of samples whose feature is non-zero)
         logdensity = torch.log(reduce(alive, "b f -> f", "mean") + 1e-6) # eps for numerical stability
@@ -572,6 +848,7 @@ class StandardTrainer:
             "loss": loss,
             "l2": l2,
             "l2_normalised": l2_normalised,
+            "explained_variance": explained_var,
             "l1": l1,
             "l0": l0,
             "cossim": cossim,
@@ -586,8 +863,11 @@ class TopkTrainer:
         sae:TopkSparseAutoencoder, 
         optimizer:Optimizer, scheduler:LRScheduler, 
         pages:int, auxk:float, bodycount:int,
-        normalise:bool = False,
-        accelerator:Accelerator = None
+        normalise:bool = True,  # Default to True to match reference
+        accelerator:Accelerator = None,
+        mse_scale: float = 1.0,
+        auxk_coef: float = 1.0,
+        log_interval: int = 100,
     ):
         self.sae = sae
         self.optimizer = optimizer
@@ -596,14 +876,29 @@ class TopkTrainer:
         self.auxk = auxk
         self.bodycount = bodycount
         self.accelerator = accelerator
-        self.deaths = torch.zeros(pages, dtype=torch.long, device=accelerator.device)
         self.normalise = normalise
+        self.mse_scale = mse_scale
+        self.auxk_coef = auxk_coef
+        self.log_interval = log_interval
+        self.step_count = 0
+        
+        # Initialize FeaturesStats for tracking
+        self.fstats = FeaturesStats(pages, self, accelerator) if accelerator else None
+
+    def logkv(self, k, v):
+        """Logger interface for FeaturesStats compatibility."""
+        if isinstance(v, torch.Tensor):
+            v = v.detach().item() if v.numel() == 1 else v.detach()
+        return v
 
     def step(self, x):
         self.optimizer.zero_grad()
 
         b, f = x.shape
-        xhat, dictionary = self.sae(x, output_features=True)
+        
+        # Forward pass - get recons, dictionary, and info dict
+        # The forward method now returns (recons, dictionary, info)
+        xhat, dictionary, info = self.sae(x, output_features=True)
 
         cossim = torch.nn.CosineSimilarity(dim=-1)
         l2 = reduce((x - xhat) ** 2, "b f -> b", "sum").mean()
@@ -611,10 +906,13 @@ class TopkTrainer:
 
         l0 = (dictionary > 0).float().sum(dim=-1).mean() # how many entries are alive on average
         alive = (dictionary > 0).float()
-        cossim = cossim(x, xhat).mean()
+        cossim_val = cossim(x, xhat).mean()
 
         # Metric taken from OpenAI's TopK SAE paper
         l2_normalised = ((xhat - x) ** 2).mean(dim=-1).mean() / (x ** 2).mean(dim=-1).mean()
+
+        # Explained variance metric
+        explained_var = explained_variance(xhat, x)
 
         # Feature density (i.e. fraction of samples whose feature is non-zero)
         logdensity = torch.log(reduce(alive, "b f -> f", "mean") + 1e-6) # eps for numerical stability
@@ -622,38 +920,69 @@ class TopkTrainer:
         survival = reduce(dictionary, "b f -> f", "sum") > 0
         survival = survival.float().mean()
 
-        loss = l2
+        # Loss computation with MSE scaling and auxk
+        loss = self.mse_scale * mse(xhat, x)
+        
+        # Add auxk loss if auxk is enabled
+        auxk_loss = torch.tensor(0.0, device=x.device)
+        if self.auxk is not None and self.auxk > 0 and info is not None and info.get("auxk_inds") is not None:
+            auxk_inds = info["auxk_inds"]  # Shape: (batch, auxk)
+            auxk_vals = info["auxk_vals"]  # Shape: (batch, auxk)
+            
+            # Decode from auxk features
+            auxk_recons = self.sae.decode_sparse(auxk_inds, auxk_vals)
+            
+            # Auxk loss: normalized MSE on the residual
+            # The residual is what the main SAE couldn't reconstruct
+            residual = x - xhat.detach() + self.sae.pre_bias.detach()
+            auxk_loss = self.auxk_coef * normalized_mse(auxk_recons, residual).nan_to_num(0.0)
+            loss = loss + auxk_loss
 
         self.accelerator.backward(loss)
         self.accelerator.clip_grad_norm_(self.sae.parameters(), 1.0)
 
-        if self.normalise:
-            self.sae.decoder.weight.data = self.sae.decoder.weight.data / self.sae.decoder.weight.data.norm(dim=0, keepdim=True)
-            paralell = einsum(
-                self.sae.decoder.weight.grad,
-                self.sae.decoder.weight.data,
-                'd f, d f -> f'
-            )
-
-            self.sae.decoder.weight.grad -= einsum(
-                paralell,
-                self.sae.decoder.weight.data,
-                'f, d f -> d f'
-            )
+        # Always normalize decoder and adjust gradients (matching reference)
+        unit_norm_decoder_(self.sae)
+        unit_norm_decoder_grad_adjustment_(self.sae)
 
         self.optimizer.step()
         self.scheduler.step()
+        
+        self.step_count += 1
+
+        # Track feature activations
+        if self.fstats is not None and info is not None:
+            # inds is already in shape (batch, k)
+            inds = info["inds"]
+            self.fstats.update(inds)
+            
+            # Log feature stats periodically
+            if self.step_count % self.log_interval == 0:
+                self.fstats.log()
+                self.fstats.reinit()
+
+        # Track dead features
+        bs = x.shape[0]
+        not_activated_1e4 = (self.sae.stats_last_nonzero > 1e4 / bs).float().mean()
+        not_activated_1e6 = (self.sae.stats_last_nonzero > 1e6 / bs).float().mean()
+        not_activated_1e7 = (self.sae.stats_last_nonzero > 1e7 / bs).float().mean()
 
         self.accelerator.log({
             "loss": loss,
             "l2": l2,
             "l2_normalised": l2_normalised,
+            "explained_variance": explained_var,
             "l1": l1,
             "l0": l0,
-            "cossim": cossim,
+            "cossim": cossim_val,
             "alive": alive.mean(),
             "survival": survival,
-            "density": tohist(logdensity)
+            "density": tohist(logdensity),
+            "auxk_loss": auxk_loss,
+            "not-activated_1e4": not_activated_1e4,
+            "not-activated_1e6": not_activated_1e6,
+            "not-activated_1e7": not_activated_1e7,
+            "l2_div": (torch.linalg.norm(xhat, dim=1) / torch.linalg.norm(x, dim=1)).mean(),
         })
 
 class ConstrainedAdam(torch.optim.Adam):
@@ -710,6 +1039,10 @@ class GatedTrainer:
         
         cossim = cossim(x, xhat).mean()
         l2_normalised = ((xhat - x) ** 2).mean(dim=-1).mean() / (x ** 2).mean(dim=-1).mean()
+        
+        # Explained variance metric
+        explained_var = explained_variance(xhat, x)
+        
         survival = reduce(dictionary, "b f -> f", "sum") > 0
         survival = survival.float().mean()
         logdensity = torch.log(reduce(alive, "b f -> f", "mean") + 1e-6) # eps for numerical stability
@@ -724,6 +1057,7 @@ class GatedTrainer:
             "aux": aux,
             "l2": l2,
             "l2_normalised": l2_normalised,
+            "explained_variance": explained_var,
             "l1": l1,
             "l0": l0,
             "cossim": cossim,
@@ -767,6 +1101,10 @@ class JumpReLUTrainer:
         
         cossim = cossim(x, xhat).mean()
         l2_normalised = ((xhat - x) ** 2).mean(dim=-1).mean() / (x ** 2).mean(dim=-1).mean()
+        
+        # Explained variance metric
+        explained_var = explained_variance(xhat, x)
+        
         survival = reduce(dictionary, "b f -> f", "sum") > 0
         survival = survival.float().mean()
         logdensity = torch.log(reduce(alive, "b f -> f", "mean") + 1e-6) # eps for numerical stability
@@ -780,6 +1118,7 @@ class JumpReLUTrainer:
             "loss": loss,
             "l2": l2,
             "l2_normalised": l2_normalised,
+            "explained_variance": explained_var,
             "l1": l1,
             "l0": l0,
             "cossim": cossim,
@@ -818,7 +1157,18 @@ def train(**config):
         case "standard":
             sae = SparseAutoencoder(features=config["features"], pages=pages)
         case "topk":
-            sae = TopkSparseAutoencoder(features=config["features"], pages=pages, k=config["k"])
+            auxk = config.get("auxk", None)
+            # Reference implementation divides by batch_size: dead_toks_threshold // cfg.bs
+            # dead_steps_threshold is in "tokens/samples", but stats_last_nonzero increments per batch
+            dead_toks_threshold = config.get("dead_steps_threshold", 10000000)
+            dead_steps_threshold = dead_toks_threshold // config["batch_size"]
+            sae = TopkSparseAutoencoder(
+                features=config["features"], 
+                pages=pages, 
+                k=config["k"],
+                auxk=auxk,
+                dead_steps_threshold=dead_steps_threshold
+            )
         case "gated":
             sae = GatedAutoEncoder(features=config["features"], pages=pages)
         case "jumprelu":
@@ -840,7 +1190,38 @@ def train(**config):
         case "standard":
             trainer = StandardTrainer(sae, optimizer, scheduler, lmbda=config["lmbda"], lmbda_warmup_steps=config["lmbda_warmup_steps"], accelerator=accelerator)
         case "topk":
-            trainer = TopkTrainer(sae, optimizer, scheduler, pages=pages, auxk=config["auxk"], bodycount=config["bodycount"], accelerator=accelerator)
+            # Compute MSE scale from a sample of data
+            mse_scale = 1.0
+            if config["dataset"] == "tensor" and hasattr(dataset, '__iter__'):
+                # Sample a few batches to compute MSE scale
+                try:
+                    sample_batches = []
+                    for i, batch in enumerate(dataloader):
+                        if i >= 10:  # Sample 10 batches
+                            break
+                        if isinstance(batch, torch.Tensor):
+                            sample_batches.append(batch)
+                        else:
+                            sample_batches.append(sampler.sample(batch))
+                    if sample_batches:
+                        stats_sample = torch.cat(sample_batches, dim=0)
+                        mse_scale = (1 / ((stats_sample.float().mean(dim=0) - stats_sample.float()) ** 2).mean()).item()
+                except:
+                    pass  # Use default mse_scale if sampling fails
+            
+            auxk_coef = config.get("auxk_coef", 1.0)
+            log_interval = config.get("log_interval", 100)
+            trainer = TopkTrainer(
+                sae, optimizer, scheduler, 
+                pages=pages, 
+                auxk=config.get("auxk", None), 
+                bodycount=config.get("bodycount", 0),
+                normalise=config.get("normalise", True),
+                accelerator=accelerator,
+                mse_scale=mse_scale,
+                auxk_coef=auxk_coef,
+                log_interval=log_interval
+            )
         case "gated":
             trainer = GatedTrainer(sae, optimizer, scheduler, lmbda=config["lmbda"], lmbda_warmup_steps=config["lmbda_warmup_steps"], accelerator=accelerator)
         case "jumprelu":

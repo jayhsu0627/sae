@@ -1,0 +1,11 @@
+# Expansion factors to test
+# Expansion factor determines the number of SAE features: pages = expansion × features
+# Values can be floats (e.g., 0.5 for compression) or integers
+expansions:
+  - 0.5
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+

@@ -1,0 +1,10 @@
+# K values to test for each expansion factor
+# K determines the top-k sparsity for TopK SAE architecture
+k_values:
+  # - 5
+  - 10
+  # - 20
+  # - 40
+  # - 80
+  # - 160
+
